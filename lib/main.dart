@@ -8,7 +8,8 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'dart:convert';
 import 'package:vector_math/vector_math.dart' as vector;
 
-import 'path_finder.dart'; // Asegúrate de que este archivo esté en tu proyecto
+import 'path_finder.dart';
+import 'risk_predictor_service.dart';
 
 void main() {
   runApp(const NEIApp());
@@ -39,29 +40,27 @@ class _MapScreenState extends State<MapScreen> {
   // --- Controladores y Servicios ---
   final MapController _mapController = MapController();
   final FlutterTts _flutterTts = FlutterTts();
+  final RiskPredictorService _riskPredictor = RiskPredictorService();
   PathFinder? _pathFinder;
   StreamSubscription<Position>? _positionStreamSubscription;
 
   // --- Estado de la UI y Navegación ---
   bool isLoading = true;
   bool isNavigating = false;
-  String loadingMessage = "Cargando datos del mapa...";
+  String loadingMessage = "Cargando modelos...";
 
-  // --- Elementos del Mapa ---
   List<Polyline> initialPaths = [];
   List<Polygon> riskZones = [];
   List<Marker> pointMarkers = [];
   Marker? _userLocationMarker;
   Polyline? _calculatedRoute;
 
-  // --- Lógica de Navegación ---
   int _currentPathIndex = 0;
   final double _arrivalThreshold = 7.0;
   final double _instructionThreshold = 12.0;
   bool _instructionGivenForCurrentIndex = false;
-  final double _offRouteThreshold = 15.0; // Distancia para considerar que está fuera de ruta
+  final double _offRouteThreshold = 15.0;
   DateTime? _lastRecalculationTime;
-
 
   @override
   void initState() {
@@ -73,6 +72,7 @@ class _MapScreenState extends State<MapScreen> {
   void dispose() {
     _positionStreamSubscription?.cancel();
     _flutterTts.stop();
+    _riskPredictor.close();
     super.dispose();
   }
 
@@ -97,7 +97,8 @@ class _MapScreenState extends State<MapScreen> {
     final String response = await rootBundle.loadString('assets/data/mapa_datos_app.json');
     final data = json.decode(response);
     final List features = data['features'];
-    _pathFinder = PathFinder(features);
+    _pathFinder = PathFinder(features, _riskPredictor);
+    await _pathFinder!.buildGraph(features);
 
     List<Polyline> tempPaths = [];
     List<Polygon> tempRiskZones = [];
@@ -134,7 +135,7 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   Future<void> _startLocationTracking() async {
-    // ... (El manejo de permisos debería estar aquí)
+    // ... (Manejo de permisos)
 
     try {
       Position initialPosition = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
@@ -190,20 +191,19 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
-  void _calculateAndShowRoute() async {
+  void _calculateAndShowRoute({bool isRecalculation = false}) async {
     if (_pathFinder == null || _userLocationMarker == null) {
-      _flutterTts.speak("Ubicación no disponible. Espere un momento.");
+      _speak("Ubicación no disponible.");
       return;
     }
 
-    // Si no estamos en modo navegación, lo activamos.
     if (!isNavigating) {
       setState(() { isNavigating = true; });
     }
 
-    setState(() {
-      _instructionGivenForCurrentIndex = false;
-    });
+    if (!isRecalculation) {
+      _pathFinder!.resetCosts();
+    }
 
     final startPoint = _userLocationMarker!.point;
     Node? closestSafePoint = _pathFinder!.findClosestSafePoint(startPoint);
@@ -218,12 +218,28 @@ class _MapScreenState extends State<MapScreen> {
       setState(() {
         _calculatedRoute = Polyline(points: path, color: Colors.green, strokeWidth: 6.0);
         _currentPathIndex = 0;
+        _instructionGivenForCurrentIndex = false;
       });
-      _speak("Ruta de evacuación encontrada. Siga la línea verde.");
+      if (!isRecalculation) {
+        _speak("Ruta de evacuación encontrada. Siga la línea verde.");
+      }
     } else {
-      setState(() { isNavigating = false; });
-      _speak("No se pudo calcular una ruta.");
+      _speak("No se pudo calcular una nueva ruta desde esta ubicación.");
     }
+  }
+
+  void _reportBlockage() {
+    if (!isNavigating || _userLocationMarker == null || _pathFinder == null || _calculatedRoute == null) return;
+    if (_currentPathIndex >= _calculatedRoute!.points.length - 1) return;
+
+    _speak("Ruta bloqueada reportada. Recalculando...");
+
+    // CORRECCIÓN: Identifica el segmento actual de la ruta y lo bloquea.
+    final segmentStart = _calculatedRoute!.points[_currentPathIndex];
+    final segmentEnd = _calculatedRoute!.points[_currentPathIndex + 1];
+    _pathFinder!.addBlockageOnSegment(segmentStart, segmentEnd);
+
+    _calculateAndShowRoute(isRecalculation: true);
   }
 
   void _updateNavigation(Position currentPosition) {
@@ -231,15 +247,13 @@ class _MapScreenState extends State<MapScreen> {
 
     final userPoint = LatLng(currentPosition.latitude, currentPosition.longitude);
 
-    // --- NUEVO: Lógica de Recálculo si está fuera de ruta ---
     if (_isUserOffRoute(userPoint)) {
       final now = DateTime.now();
-      // Solo recalcula si han pasado más de 5 segundos desde la última vez
       if (_lastRecalculationTime == null || now.difference(_lastRecalculationTime!).inSeconds > 5) {
         _lastRecalculationTime = now;
         _speak("Recalculando ruta.");
-        _calculateAndShowRoute(); // Llama a la función principal de cálculo de nuevo
-        return; // Sale para esperar la nueva ruta
+        _calculateAndShowRoute(isRecalculation: true);
+        return;
       }
     }
 
@@ -294,14 +308,11 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
-  // --- NUEVO: Función para detectar si el usuario está fuera de ruta ---
   bool _isUserOffRoute(LatLng userPoint) {
     if (_calculatedRoute == null) return false;
 
     double minDistance = double.infinity;
 
-    // Usamos una aproximación simple: encontrar la distancia al nodo más cercano de la ruta.
-    // Para rutas con muchos puntos (como las de GPS), esto es suficientemente preciso.
     for (final point in _calculatedRoute!.points) {
       final d = Geolocator.distanceBetween(
         userPoint.latitude, userPoint.longitude,
@@ -361,11 +372,26 @@ class _MapScreenState extends State<MapScreen> {
           ]),
         ],
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: isNavigating ? null : _calculateAndShowRoute,
-        label: Text(isNavigating ? "NAVEGANDO..." : "EVACUAR"),
-        icon: const Icon(Icons.directions_run),
-        backgroundColor: isNavigating ? Colors.grey : Colors.red,
+      floatingActionButton: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: [
+          if (isNavigating)
+            FloatingActionButton(
+              onPressed: _reportBlockage,
+              tooltip: 'Ruta Bloqueada',
+              child: Icon(Icons.block),
+              backgroundColor: Colors.orange,
+              heroTag: 'blockage_button',
+            ),
+          if (isNavigating) SizedBox(height: 10),
+          FloatingActionButton.extended(
+            onPressed: isNavigating ? null : _calculateAndShowRoute,
+            label: Text(isNavigating ? "NAVEGANDO..." : "EVACUAR"),
+            icon: const Icon(Icons.directions_run),
+            backgroundColor: isNavigating ? Colors.grey : Colors.red,
+            heroTag: 'evacuate_button',
+          ),
+        ],
       ),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
     );

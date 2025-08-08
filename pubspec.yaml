@@ -38,6 +38,7 @@ dependencies:
   latlong2: ^0.9.0
   flutter_tts: ^3.8.3 # Añade esta línea
   vector_math: ^2.1.4
+  tflite_flutter: ^0.11.0
   
   cupertino_icons: ^1.0.2
   geolocator: ^14.0.2
@@ -67,6 +68,7 @@ flutter:
   # Para incluir assets en tu aplicación, añade una sección de assets como esta:
   assets:
     - assets/data/
+    - assets/ml/
 
   # To add assets to your application, add an assets section, like this:
   # assets:
