@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <GroundOverlay>
+    <name>Espe_Offline_Map 16</name>
+    <Icon>
+      <href>files/Espe_Offline_Map_16.JPG</href>
+      <drawOrder>0</drawOrder>
+    </Icon>
+    <LatLonBox>
+      <north>-0.307616</north>
+      <south>-0.324095</south>
+      <east>-78.43689</east>
+      <west>-78.453369</west>
+      <rotation>0.0</rotation>
+    </LatLonBox>
+  </GroundOverlay>
+</kml>
