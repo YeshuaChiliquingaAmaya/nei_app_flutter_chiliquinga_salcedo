@@ -1,0 +1,796 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'dart:convert';
+import 'package:vector_math/vector_math.dart' as vector;
+import 'chatbot/chat_screen.dart';
+import 'chatbot/chatbot_service.dart';
+import 'path_finder.dart';
+
+void main() {
+  runApp(const NEIApp());
+}
+
+class NEIApp extends StatelessWidget {
+  const NEIApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Navegador de Evacuación Inteligente',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(primarySwatch: Colors.indigo),
+      home: const MapScreen(),
+    );
+  }
+}
+
+class MapScreen extends StatefulWidget {
+  const MapScreen({super.key});
+
+  @override
+  State<MapScreen> createState() => _MapScreenState();
+}
+
+class _MapScreenState extends State<MapScreen> {
+  // --- Controladores y Servicios ---
+  final MapController _mapController = MapController();
+  final FlutterTts _flutterTts = FlutterTts();
+  PathFinder? _pathFinder;
+  StreamSubscription<Position>? _positionStreamSubscription;
+  late ChatbotEvacuacionESPE _chatbot;
+
+  // --- Estado de la UI y Navegación ---
+  bool isLoading = true;
+  bool isNavigating = false;
+  String loadingMessage = "Cargando datos del mapa...";
+
+  // --- Elementos del Mapa ---
+  List<Polyline> initialPaths = [];
+  List<Polygon> riskZones = [];
+  List<Marker> pointMarkers = [];
+  Marker? _userLocationMarker;
+  Polyline? _calculatedRoute;
+
+  // --- Lógica de Navegación ---
+  int _currentPathIndex = 0;
+  final double _arrivalThreshold = 7.0;
+  final double _instructionThreshold = 12.0;
+  bool _instructionGivenForCurrentIndex = false;
+  final double _offRouteThreshold = 15.0;
+  DateTime? _lastRecalculationTime;
+
+  @override
+  void initState() {
+    super.initState();
+    _initialize();
+  }
+
+  @override
+  void dispose() {
+    _positionStreamSubscription?.cancel();
+    _flutterTts.stop();
+    super.dispose();
+  }
+
+  Future<void> _initialize() async {
+    await _loadMapData();
+    await _setupTts();
+    // CLAVE: Primero verifica y solicita permisos
+    await _checkAndRequestLocationPermission();
+    _initializeChatbot();
+    await _startLocationTracking();
+  }
+
+  // FUNCIÓN AÑADIDA: Manejo de permisos de ubicación
+  Future<void> _checkAndRequestLocationPermission() async {
+    setState(() {
+      loadingMessage = "Verificando permisos de ubicación...";
+    });
+
+    bool serviceEnabled;
+    LocationPermission permission;
+
+    // Verificar si el servicio de ubicación está habilitado
+    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      setState(() {
+        loadingMessage = "El servicio de ubicación está deshabilitado.\nPor favor, habilítalo en la configuración.";
+      });
+      return;
+    }
+
+    permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        setState(() {
+          loadingMessage = "Permisos de ubicación denegados.\nLa aplicación necesita acceso a la ubicación para funcionar.";
+        });
+        return;
+      }
+    }
+
+    if (permission == LocationPermission.deniedForever) {
+      setState(() {
+        loadingMessage = "Permisos de ubicación denegados permanentemente.\nPor favor, habilítalos en la configuración del dispositivo.";
+      });
+      return;
+    }
+
+    setState(() {
+      loadingMessage = "Obteniendo ubicación GPS...";
+    });
+  }
+
+  void _initializeChatbot() {
+    _chatbot = ChatbotEvacuacionESPE(
+      pathFinder: _pathFinder,
+      userLocation: _userLocationMarker?.point,
+      onNavigationRequest: _handleNavigationRequest,
+      onSpeakRequest: _speak,
+    );
+  }
+
+  void _handleNavigationRequest(String action) {
+    switch (action) {
+      case "start":
+        _calculateAndShowRoute();
+        break;
+      case "recalculate":
+        _calculateAndShowRoute();
+        break;
+      case "stop":
+        _stopNavigation();
+        break;
+    }
+  }
+
+  void _stopNavigation() {
+    setState(() {
+      isNavigating = false;
+      _calculatedRoute = null;
+    });
+    _speak("Navegación detenida.");
+  }
+
+  Future<void> _setupTts() async {
+    await _flutterTts.setLanguage("es-EC");
+    await _flutterTts.setPitch(1.0);
+    await _flutterTts.setSpeechRate(0.5);
+  }
+
+  Future<void> _speak(String text) async {
+    await _flutterTts.stop();
+    await _flutterTts.speak(text);
+  }
+
+  Future<void> _loadMapData() async {
+    final String response = await rootBundle.loadString('assets/data/mapa_datos_app.json');
+    final data = json.decode(response);
+    final List features = data['features'];
+    _pathFinder = PathFinder(features);
+
+    List<Polyline> tempPaths = [];
+    List<Polygon> tempRiskZones = [];
+    List<Marker> tempMarkers = [];
+
+    for (var feature in features) {
+      final properties = feature['properties'];
+      final geometry = feature['geometry'];
+      final type = geometry['type'];
+      final coordinates = geometry['coordinates'];
+
+      if (type == 'LineString') {
+        List<LatLng> points = (coordinates as List).map((c) => LatLng(c[1], c[0])).toList();
+        tempPaths.add(Polyline(points: points, color: Colors.grey.withOpacity(0.7), strokeWidth: 2.0));
+      } else if (type == 'Point') {
+        bool isSafe = properties['es_punto_seguro'] ?? false;
+        if(isSafe){
+          tempMarkers.add(
+            Marker(
+              width: 40.0, height: 40.0, point: LatLng(coordinates[1], coordinates[0]),
+              child: Icon(Icons.shield, color: Colors.green.shade600, size: 30.0),
+            ),
+          );
+        }
+      } else if (type == 'Polygon') {
+        List<LatLng> points = (coordinates[0] as List).map((c) => LatLng(c[1], c[0])).toList();
+        tempRiskZones.add(Polygon(points: points, color: Colors.red.withAlpha(80), borderColor: Colors.red, borderStrokeWidth: 2));
+      }
+    }
+
+    setState(() {
+      initialPaths = tempPaths;
+      riskZones = tempRiskZones;
+      pointMarkers = tempMarkers;
+    });
+  }
+
+  Future<void> _startLocationTracking() async {
+    try {
+      setState(() {
+        loadingMessage = "Obteniendo ubicación inicial...";
+      });
+
+      // MEJORADO: Configuración más robusta para obtener ubicación
+      Position initialPosition = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+        timeLimit: const Duration(seconds: 15),
+      );
+
+      final userLatLng = LatLng(initialPosition.latitude, initialPosition.longitude);
+
+      setState(() {
+        _userLocationMarker = Marker(
+          point: userLatLng,
+          width: 80,
+          height: 80,
+          child: Transform.rotate(
+            angle: vector.radians(initialPosition.heading),
+            child: const Icon(Icons.navigation, color: Colors.blueAccent, size: 40),
+          ),
+        );
+        isLoading = false;
+        loadingMessage = "Ubicación obtenida correctamente";
+      });
+
+      // Actualizar chatbot con nueva ubicación
+      _updateChatbotLocation(userLatLng);
+
+      _mapController.move(userLatLng, 19.0);
+
+      print("Ubicación inicial obtenida: ${userLatLng.latitude}, ${userLatLng.longitude}");
+
+    } catch (e) {
+      setState(() {
+        isLoading = false;
+        loadingMessage = "Error al obtener ubicación: $e";
+      });
+      print("Error al obtener ubicación inicial: $e");
+
+      // Mostrar diálogo de error
+      _showLocationErrorDialog();
+      return;
+    }
+
+    // MEJORADO: Configuración del stream de ubicación
+    final locationSettings = LocationSettings(
+      accuracy: LocationAccuracy.high,
+      distanceFilter: 2,
+    );
+
+    _positionStreamSubscription = Geolocator.getPositionStream(
+        locationSettings: locationSettings
+    ).listen(
+          (Position position) {
+        final userLatLng = LatLng(position.latitude, position.longitude);
+
+        setState(() {
+          _userLocationMarker = Marker(
+            point: userLatLng,
+            width: 80,
+            height: 80,
+            child: Transform.rotate(
+              angle: vector.radians(position.heading),
+              child: const Icon(Icons.navigation, color: Colors.blueAccent, size: 40),
+            ),
+          );
+        });
+
+        // Actualizar chatbot con nueva ubicación
+        _updateChatbotLocation(userLatLng);
+
+        if (isNavigating) {
+          _mapController.move(userLatLng, 19.0);
+          _updateNavigation(position);
+        }
+      },
+      onError: (error) {
+        print("Error en stream de ubicación: $error");
+      },
+    );
+  }
+
+  // FUNCIÓN AÑADIDA: Mostrar diálogo de error de ubicación
+  void _showLocationErrorDialog() {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text("Error de Ubicación"),
+          content: const Text(
+              "No se pudo obtener la ubicación GPS.\n\n"
+                  "Verifica que:\n"
+                  "• El GPS esté activado\n"
+                  "• Tengas permisos de ubicación\n"
+                  "• Estés en un lugar con buena señal GPS"
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: const Text("Cerrar"),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _checkAndRequestLocationPermission();
+                _startLocationTracking();
+              },
+              child: const Text("Reintentar"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _updateChatbotLocation(LatLng newLocation) {
+    _chatbot = ChatbotEvacuacionESPE(
+      pathFinder: _pathFinder,
+      userLocation: newLocation,
+      onNavigationRequest: _handleNavigationRequest,
+      onSpeakRequest: _speak,
+    );
+  }
+
+  void _recenterMapOnUser() {
+    if (_userLocationMarker != null) {
+      _mapController.move(_userLocationMarker!.point, 19.0);
+    } else {
+      // Si no hay ubicación, intentar obtenerla de nuevo
+      _startLocationTracking();
+    }
+  }
+
+  void _calculateAndShowRoute() async {
+    if (_pathFinder == null || _userLocationMarker == null) {
+      _speak("Ubicación no disponible. Espere un momento.");
+      return;
+    }
+
+    if (!isNavigating) {
+      setState(() { isNavigating = true; });
+    }
+
+    setState(() {
+      _instructionGivenForCurrentIndex = false;
+    });
+
+    final startPoint = _userLocationMarker!.point;
+    Node? closestSafePoint = _pathFinder!.findClosestSafePoint(startPoint);
+    if (closestSafePoint == null) {
+      setState(() { isNavigating = false; });
+      _speak("No se encontró una zona segura cercana.");
+      return;
+    }
+
+    final path = _pathFinder!.findShortestPath(startPoint, closestSafePoint.position);
+
+    if (path.isNotEmpty) {
+      setState(() {
+        _calculatedRoute = Polyline(points: path, color: Colors.green, strokeWidth: 6.0);
+        _currentPathIndex = 0;
+      });
+      _speak("Ruta de evacuación encontrada. Siga la línea verde.");
+    } else {
+      setState(() { isNavigating = false; });
+      _speak("No se pudo calcular una ruta.");
+    }
+  }
+
+  void _updateNavigation(Position currentPosition) {
+    if (_calculatedRoute == null || _calculatedRoute!.points.isEmpty) return;
+
+    final userPoint = LatLng(currentPosition.latitude, currentPosition.longitude);
+
+    // Lógica de recálculo si está fuera de ruta
+    if (_isUserOffRoute(userPoint)) {
+      final now = DateTime.now();
+      if (_lastRecalculationTime == null || now.difference(_lastRecalculationTime!).inSeconds > 5) {
+        _lastRecalculationTime = now;
+        _speak("Recalculando ruta.");
+        _calculateAndShowRoute();
+        return;
+      }
+    }
+
+    final pathPoints = _calculatedRoute!.points;
+
+    if (_currentPathIndex >= pathPoints.length - 1) {
+      final distanceToEnd = Geolocator.distanceBetween(userPoint.latitude, userPoint.longitude, pathPoints.last.latitude, pathPoints.last.longitude);
+      if (distanceToEnd < _arrivalThreshold) {
+        _speak("Ha llegado a la zona segura.");
+        setState(() {
+          isNavigating = false;
+          _calculatedRoute = null;
+        });
+        return;
+      }
+    }
+
+    final nextWaypoint = pathPoints[_currentPathIndex + 1];
+    final distanceToNextWaypoint = Geolocator.distanceBetween(userPoint.latitude, userPoint.longitude, nextWaypoint.latitude, nextWaypoint.longitude);
+
+    if (distanceToNextWaypoint < _arrivalThreshold) {
+      setState(() {
+        _currentPathIndex++;
+        _instructionGivenForCurrentIndex = false;
+      });
+      return;
+    }
+
+    if (distanceToNextWaypoint < _instructionThreshold && !_instructionGivenForCurrentIndex) {
+      if (_currentPathIndex < pathPoints.length - 2) {
+        final currentWaypoint = pathPoints[_currentPathIndex];
+        final upcomingWaypoint = pathPoints[_currentPathIndex + 2];
+
+        final bearing = Geolocator.bearingBetween(
+          currentWaypoint.latitude, currentWaypoint.longitude,
+          nextWaypoint.latitude, nextWaypoint.longitude,
+        );
+        final nextBearing = Geolocator.bearingBetween(
+          nextWaypoint.latitude, nextWaypoint.longitude,
+          upcomingWaypoint.latitude, upcomingWaypoint.longitude,
+        );
+
+        final turn = _getTurnInstruction(bearing, nextBearing);
+        int distance = distanceToNextWaypoint.round();
+        _speak("En $distance metros, $turn");
+
+        setState(() {
+          _instructionGivenForCurrentIndex = true;
+        });
+      }
+    }
+  }
+
+  bool _isUserOffRoute(LatLng userPoint) {
+    if (_calculatedRoute == null) return false;
+
+    double minDistance = double.infinity;
+
+    for (final point in _calculatedRoute!.points) {
+      final d = Geolocator.distanceBetween(
+        userPoint.latitude, userPoint.longitude,
+        point.latitude, point.longitude,
+      );
+      if (d < minDistance) {
+        minDistance = d;
+      }
+    }
+
+    return minDistance > _offRouteThreshold;
+  }
+
+  String _getTurnInstruction(double currentBearing, double targetBearing) {
+    final angle = (targetBearing - currentBearing + 360) % 360;
+
+    if (angle > 330 || angle < 30) {
+      return "continúe recto.";
+    } else if (angle >= 30 && angle < 150) {
+      return "gire a la derecha.";
+    } else if (angle >= 150 && angle < 210) {
+      return "dé la vuelta.";
+    } else {
+      return "gire a la izquierda.";
+    }
+  }
+
+  void _openChatbot() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => ChatbotBottomSheet(chatbot: _chatbot),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Navegador de Evacuación ESPE'),
+        backgroundColor: Colors.indigo,
+        foregroundColor: Colors.white,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.chat_bubble_outline),
+            onPressed: _openChatbot,
+            tooltip: 'Asistente de evacuación',
+          ),
+          IconButton(
+            icon: const Icon(Icons.gps_fixed),
+            onPressed: _recenterMapOnUser,
+            tooltip: 'Centrar en mi ubicación',
+          ),
+        ],
+      ),
+      body: isLoading
+          ? Center(
+          child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const CircularProgressIndicator(),
+                const SizedBox(height: 20),
+                Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Text(
+                    loadingMessage,
+                    style: const TextStyle(fontSize: 16),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+                if (loadingMessage.contains("Error") || loadingMessage.contains("denegado"))
+                  ElevatedButton(
+                    onPressed: () {
+                      _checkAndRequestLocationPermission();
+                      _startLocationTracking();
+                    },
+                    child: const Text("Reintentar"),
+                  ),
+              ]
+          )
+      )
+          : FlutterMap(
+        mapController: _mapController,
+        options: const MapOptions(
+          initialCenter: LatLng(-0.3135, -78.4455),
+          initialZoom: 19.0,
+        ),
+        children: [
+          TileLayer(urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'),
+          PolygonLayer(polygons: riskZones),
+          PolylineLayer(polylines: initialPaths),
+          if (_calculatedRoute != null) PolylineLayer(polylines: [_calculatedRoute!]),
+          MarkerLayer(markers: [
+            ...pointMarkers,
+            if (_userLocationMarker != null) _userLocationMarker!,
+          ]),
+        ],
+      ),
+      floatingActionButton: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: [
+          if (!isNavigating)
+            FloatingActionButton(
+              heroTag: "chat",
+              onPressed: _openChatbot,
+              backgroundColor: Colors.blue,
+              child: const Icon(Icons.smart_toy),
+              tooltip: 'Chatbot de evacuación',
+            ),
+          const SizedBox(height: 16),
+          FloatingActionButton.extended(
+            heroTag: "navigate",
+            onPressed: isNavigating ? _stopNavigation : _calculateAndShowRoute,
+            label: Text(isNavigating ? "DETENER" : "EVACUAR"),
+            icon: Icon(isNavigating ? Icons.stop : Icons.directions_run),
+            backgroundColor: isNavigating ? Colors.orange : Colors.red,
+          ),
+        ],
+      ),
+      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+    );
+  }
+}
+
+// Widget para el chatbot en bottom sheet
+class ChatbotBottomSheet extends StatefulWidget {
+  final ChatbotEvacuacionESPE chatbot;
+
+  const ChatbotBottomSheet({super.key, required this.chatbot});
+
+  @override
+  State<ChatbotBottomSheet> createState() => _ChatbotBottomSheetState();
+}
+
+class _ChatbotBottomSheetState extends State<ChatbotBottomSheet> {
+  final TextEditingController _textController = TextEditingController();
+  final List<ChatMessage> _messages = [];
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    _addMessage(ChatMessage(
+      text: "🆘 ¡Hola! Soy tu asistente de evacuación ESPE.\n\n🗣️ Puedes preguntarme:\n• 'navegar' - Para iniciar navegación\n• 'zona segura más cercana'\n• 'medidas de protección'\n• 'contactos de emergencia'\n\n¿En qué te puedo ayudar?",
+      isUser: false,
+    ));
+  }
+
+  void _addMessage(ChatMessage message) {
+    setState(() {
+      _messages.add(message);
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  void _sendMessage(String text) {
+    if (text.trim().isEmpty) return;
+
+    _addMessage(ChatMessage(text: text, isUser: true));
+    _textController.clear();
+
+    // Procesar con el chatbot
+    String intention = widget.chatbot.detectarIntencion(text);
+    String response = widget.chatbot.responder(intention);
+
+    _addMessage(ChatMessage(text: response, isUser: false));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DraggableScrollableSheet(
+      initialChildSize: 0.6,
+      minChildSize: 0.3,
+      maxChildSize: 0.9,
+      builder: (context, scrollController) {
+        return Container(
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          child: Column(
+            children: [
+              // Handle bar
+              Container(
+                width: 40,
+                height: 4,
+                margin: const EdgeInsets.symmetric(vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.grey[300],
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              // Header
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.indigo,
+                  borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.smart_toy, color: Colors.white, size: 24),
+                    const SizedBox(width: 8),
+                    const Text(
+                      'Asistente de Evacuación',
+                      style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                    const Spacer(),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white),
+                      onPressed: () => Navigator.pop(context),
+                    ),
+                  ],
+                ),
+              ),
+              // Messages
+              Expanded(
+                child: ListView.builder(
+                  controller: _scrollController,
+                  padding: const EdgeInsets.all(8),
+                  itemCount: _messages.length,
+                  itemBuilder: (context, index) {
+                    return _buildMessageBubble(_messages[index]);
+                  },
+                ),
+              ),
+              // Input area
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.grey[100],
+                  border: Border(top: BorderSide(color: Colors.grey[300]!)),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _textController,
+                        decoration: InputDecoration(
+                          hintText: 'Pregunta sobre evacuación...',
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(20),
+                            borderSide: BorderSide.none,
+                          ),
+                          filled: true,
+                          fillColor: Colors.white,
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        ),
+                        onSubmitted: _sendMessage,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FloatingActionButton(
+                      mini: true,
+                      onPressed: () => _sendMessage(_textController.text),
+                      backgroundColor: Colors.indigo,
+                      child: const Icon(Icons.send, color: Colors.white),
+                    ),
+                  ],
+                ),
+              ),
+              // Quick action buttons
+              Container(
+                padding: const EdgeInsets.all(8),
+                child: Wrap(
+                  spacing: 8,
+                  children: [
+                    _buildQuickButton("🧭 Navegar", "navegar"),
+                    _buildQuickButton("📍 Zona segura", "zona segura más cercana"),
+                    _buildQuickButton("⚠️ Medidas", "medidas de protección"),
+                    _buildQuickButton("📞 Emergencia", "contactos de emergencia"),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildMessageBubble(ChatMessage message) {
+    return Align(
+      alignment: message.isUser ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: message.isUser ? Colors.indigo : Colors.grey[200],
+          borderRadius: BorderRadius.circular(16),
+        ),
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.8,
+        ),
+        child: Text(
+          message.text,
+          style: TextStyle(
+            color: message.isUser ? Colors.white : Colors.black,
+            fontSize: 14,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildQuickButton(String label, String message) {
+    return ElevatedButton(
+      onPressed: () => _sendMessage(message),
+      style: ElevatedButton.styleFrom(
+        backgroundColor: Colors.indigo.shade50,
+        foregroundColor: Colors.indigo,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        minimumSize: Size.zero,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
+      child: Text(label, style: const TextStyle(fontSize: 12)),
+    );
+  }
+}
+
+class ChatMessage {
+  final String text;
+  final bool isUser;
+  final DateTime timestamp;
+
+  ChatMessage({
+    required this.text,
+    required this.isUser,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+}
